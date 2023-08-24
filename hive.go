@@ -86,6 +86,14 @@ func NewConnectConfiguration() *ConnectConfiguration {
 	}
 }
 
+func (c *Connection) GetClient() *hiveserver.TCLIServiceClient {
+	return c.client
+}
+
+func (c *Connection) GetSessionHandle() *hiveserver.TSessionHandle {
+	return c.sessionHandle
+}
+
 // HiveError represents an error surfaced from Hive. We attach the specific Error code along with the usual message.
 type HiveError struct {
 	error
@@ -684,7 +692,7 @@ func (c *Cursor) fetchIfEmpty(ctx context.Context) {
 	}
 }
 
-//RowMap returns one row as a map. Advances the cursor one
+// RowMap returns one row as a map. Advances the cursor one
 func (c *Cursor) RowMap(ctx context.Context) map[string]interface{} {
 	c.Err = nil
 	c.fetchIfEmpty(ctx)
