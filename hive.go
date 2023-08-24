@@ -17,15 +17,14 @@ import (
 	"time"
 
 	"github.com/apache/thrift/lib/go/thrift"
-	"github.com/beltran/gohive/hiveserver"
 	"github.com/beltran/gosasl"
 	"github.com/go-zookeeper/zk"
+	"github.com/mlycore/bgohive/hiveserver"
 	"github.com/pkg/errors"
 )
 
 const DEFAULT_FETCH_SIZE int64 = 1000
 const ZOOKEEPER_DEFAULT_NAMESPACE = "hiveserver2"
-const DEFAULT_MAX_LENGTH = 16384000
 
 type DialContextFunc func(ctx context.Context, network, addr string) (net.Conn, error)
 
@@ -42,6 +41,14 @@ type Connection struct {
 	client              *hiveserver.TCLIServiceClient
 	configuration       *ConnectConfiguration
 	transport           thrift.TTransport
+}
+
+func (c *Connection) GetClient() *hiveserver.TCLIServiceClient {
+	return c.client
+}
+
+func (c *Connection) GetSessionHandle() *hiveserver.TSessionHandle {
+	return c.sessionHandle
 }
 
 // ConnectConfiguration is the configuration for the connection
@@ -64,9 +71,6 @@ type ConnectConfiguration struct {
 	SocketTimeout        time.Duration
 	HttpTimeout          time.Duration
 	DialContext          DialContextFunc
-	DisableKeepAlives    bool
-	// Maximum length of the data in bytes. Used for SASL.
-	MaxSize uint32
 }
 
 // NewConnectConfiguration returns a connect configuration, all with empty fields
@@ -82,16 +86,7 @@ func NewConnectConfiguration() *ConnectConfiguration {
 		HTTPPath:             "cliservice",
 		TLSConfig:            nil,
 		ZookeeperNamespace:   ZOOKEEPER_DEFAULT_NAMESPACE,
-		MaxSize:              DEFAULT_MAX_LENGTH,
 	}
-}
-
-func (c *Connection) GetClient() *hiveserver.TCLIServiceClient {
-	return c.client
-}
-
-func (c *Connection) GetSessionHandle() *hiveserver.TSessionHandle {
-	return c.sessionHandle
 }
 
 // HiveError represents an error surfaced from Hive. We attach the specific Error code along with the usual message.
@@ -114,11 +109,10 @@ func ConnectZookeeper(hosts string, auth string,
 	if err != nil {
 		return nil, err
 	}
-	defer zkConn.Close()
 
 	hsInfos, _, err := zkConn.Children("/" + configuration.ZookeeperNamespace)
 	if err != nil {
-		return nil, err
+		panic(err)
 	}
 	if len(hsInfos) > 0 {
 		nodes := parseHiveServer2Info(hsInfos)
@@ -221,16 +215,19 @@ func innerConnect(ctx context.Context, host string, port int, auth string,
 		}
 	} else {
 		if configuration.TLSConfig != nil {
-			socket = thrift.NewTSSLSocketConf(addr, &thrift.TConfiguration{
+			socket, err = thrift.NewTSSLSocketConf(addr, &thrift.TConfiguration{
 				ConnectTimeout: configuration.ConnectTimeout,
 				SocketTimeout:  configuration.SocketTimeout,
 				TLSConfig:      configuration.TLSConfig,
 			})
 		} else {
-			socket = thrift.NewTSocketConf(addr, &thrift.TConfiguration{
+			socket, err = thrift.NewTSocketConf(addr, &thrift.TConfiguration{
 				ConnectTimeout: configuration.ConnectTimeout,
 				SocketTimeout:  configuration.SocketTimeout,
 			})
+		}
+		if err != nil {
+			return
 		}
 		if err = socket.Open(); err != nil {
 			return
@@ -307,19 +304,19 @@ func innerConnect(ctx context.Context, host string, port int, auth string,
 			}
 		} else if auth == "NONE" || auth == "LDAP" || auth == "CUSTOM" {
 			saslConfiguration := map[string]string{"username": configuration.Username, "password": configuration.Password}
-			transport, err = NewTSaslTransport(socket, host, "PLAIN", saslConfiguration, configuration.MaxSize)
+			transport, err = NewTSaslTransport(socket, host, "PLAIN", saslConfiguration)
 			if err != nil {
 				return
 			}
 		} else if auth == "KERBEROS" {
 			saslConfiguration := map[string]string{"service": configuration.Service}
-			transport, err = NewTSaslTransport(socket, host, "GSSAPI", saslConfiguration, configuration.MaxSize)
+			transport, err = NewTSaslTransport(socket, host, "GSSAPI", saslConfiguration)
 			if err != nil {
 				return
 			}
 		} else if auth == "DIGEST-MD5" {
 			saslConfiguration := map[string]string{"username": configuration.Username, "password": configuration.Password, "service": configuration.Service}
-			transport, err = NewTSaslTransport(socket, host, "DIGEST-MD5", saslConfiguration, configuration.MaxSize)
+			transport, err = NewTSaslTransport(socket, host, "DIGEST-MD5", saslConfiguration)
 			if err != nil {
 				return
 			}
@@ -381,9 +378,8 @@ func getHTTPClient(configuration *ConnectConfiguration) (httpClient *http.Client
 		httpClient = &http.Client{
 			Timeout: configuration.HttpTimeout,
 			Transport: &http.Transport{
-				TLSClientConfig:   configuration.TLSConfig,
-				DialContext:       configuration.DialContext,
-				DisableKeepAlives: configuration.DisableKeepAlives,
+				TLSClientConfig: configuration.TLSConfig,
+				DialContext:     configuration.DialContext,
 			},
 		}
 		protocol = "https"
@@ -391,8 +387,7 @@ func getHTTPClient(configuration *ConnectConfiguration) (httpClient *http.Client
 		httpClient = &http.Client{
 			Timeout: configuration.HttpTimeout,
 			Transport: &http.Transport{
-				DialContext:       configuration.DialContext,
-				DisableKeepAlives: configuration.DisableKeepAlives,
+				DialContext: configuration.DialContext,
 			},
 		}
 		protocol = "http"
@@ -478,7 +473,7 @@ func (c *Cursor) WaitForCompletion(ctx context.Context) {
 			return
 		}
 		status := operationStatus.OperationState
-		finished := !(*status == hiveserver.TOperationState_INITIALIZED_STATE || *status == hiveserver.TOperationState_RUNNING_STATE || *status == hiveserver.TOperationState_PENDING_STATE)
+		finished := !(*status == hiveserver.TOperationState_INITIALIZED_STATE || *status == hiveserver.TOperationState_RUNNING_STATE)
 		if finished {
 			if *operationStatus.OperationState != hiveserver.TOperationState_FINISHED_STATE {
 				msg := operationStatus.TaskStatus
@@ -601,11 +596,10 @@ func (c *Cursor) executeAsync(ctx context.Context, query string) {
 		return
 	}
 	if !success(safeStatus(responseExecute.GetStatus())) {
-		status := safeStatus(responseExecute.GetStatus())
 		c.Err = HiveError{
-			error:     errors.New("Error while executing query: " + status.String()),
-			Message:   status.GetErrorMessage(),
-			ErrorCode: int(status.GetErrorCode()),
+			error:     errors.New("Error while executing query: " + safeStatus(responseExecute.GetStatus()).String()),
+			Message:   *safeStatus(responseExecute.GetStatus()).ErrorMessage,
+			ErrorCode: int(*safeStatus(responseExecute.GetStatus()).ErrorCode),
 		}
 		return
 	}
@@ -646,7 +640,7 @@ func (c *Cursor) FetchLogs() []string {
 	logRequest.FetchType = 1
 
 	resp, err := c.conn.client.FetchResults(context.Background(), logRequest)
-	if err != nil || resp == nil || resp.Results == nil {
+	if err != nil {
 		c.Err = err
 		return nil
 	}
@@ -833,7 +827,7 @@ func (c *Cursor) FetchOne(ctx context.Context, dests ...interface{}) {
 			}
 			d, ok := dests[i].(*[]byte)
 			if !ok {
-				c.Err = errors.Errorf("Unexpected data type %T for value %v (should be %T) index is %v", dests[i], c.queue[i].BinaryVal.Values[c.columnIndex], c.queue[i].BinaryVal.Values[c.columnIndex], i)
+				c.Err = errors.Errorf("Unexpected data type %T for value %v (should be %T)", dests[i], c.queue[i].BinaryVal.Values[c.columnIndex], c.queue[i].BinaryVal.Values[c.columnIndex])
 				return
 			}
 			if isNull(c.queue[i].BinaryVal.Nulls, c.columnIndex) {
@@ -850,16 +844,13 @@ func (c *Cursor) FetchOne(ctx context.Context, dests ...interface{}) {
 			if !ok {
 				d, ok := dests[i].(**int8)
 				if !ok {
-					c.Err = errors.Errorf("Unexpected data type %T for value %v (should be %T) index is %v", dests[i], c.queue[i].ByteVal.Values[c.columnIndex], c.queue[i].ByteVal.Values[c.columnIndex], i)
+					c.Err = errors.Errorf("Unexpected data type %T for value %v (should be %T)", dests[i], c.queue[i].ByteVal.Values[c.columnIndex], c.queue[i].ByteVal.Values[c.columnIndex])
 					return
 				}
 
 				if isNull(c.queue[i].ByteVal.Nulls, c.columnIndex) {
 					*d = nil
 				} else {
-					if *d == nil {
-						*d = new(int8)
-					}
 					**d = c.queue[i].ByteVal.Values[c.columnIndex]
 				}
 			} else {
@@ -875,16 +866,13 @@ func (c *Cursor) FetchOne(ctx context.Context, dests ...interface{}) {
 			if !ok {
 				d, ok := dests[i].(**int16)
 				if !ok {
-					c.Err = errors.Errorf("Unexpected data type %T for value %v (should be %T) index is %v", dests[i], c.queue[i].I16Val.Values[c.columnIndex], c.queue[i].I16Val.Values[c.columnIndex], i)
+					c.Err = errors.Errorf("Unexpected data type %T for value %v (should be %T)", dests[i], c.queue[i].I16Val.Values[c.columnIndex], c.queue[i].I16Val.Values[c.columnIndex])
 					return
 				}
 
 				if isNull(c.queue[i].I16Val.Nulls, c.columnIndex) {
 					*d = nil
 				} else {
-					if *d == nil {
-						*d = new(int16)
-					}
 					**d = c.queue[i].I16Val.Values[c.columnIndex]
 				}
 			} else {
@@ -899,16 +887,13 @@ func (c *Cursor) FetchOne(ctx context.Context, dests ...interface{}) {
 			if !ok {
 				d, ok := dests[i].(**int32)
 				if !ok {
-					c.Err = errors.Errorf("Unexpected data type %T for value %v (should be %T) index is %v", dests[i], c.queue[i].I32Val.Values[c.columnIndex], c.queue[i].I32Val.Values[c.columnIndex], i)
+					c.Err = errors.Errorf("Unexpected data type %T for value %v (should be %T)", dests[i], c.queue[i].I32Val.Values[c.columnIndex], c.queue[i].I32Val.Values[c.columnIndex])
 					return
 				}
 
 				if isNull(c.queue[i].I32Val.Nulls, c.columnIndex) {
 					*d = nil
 				} else {
-					if *d == nil {
-						*d = new(int32)
-					}
 					**d = c.queue[i].I32Val.Values[c.columnIndex]
 				}
 			} else {
@@ -923,16 +908,13 @@ func (c *Cursor) FetchOne(ctx context.Context, dests ...interface{}) {
 			if !ok {
 				d, ok := dests[i].(**int64)
 				if !ok {
-					c.Err = errors.Errorf("Unexpected data type %T for value %v (should be %T) index is %v", dests[i], c.queue[i].I64Val.Values[c.columnIndex], c.queue[i].I64Val.Values[c.columnIndex], i)
+					c.Err = errors.Errorf("Unexpected data type %T for value %v (should be %T)", dests[i], c.queue[i].I64Val.Values[c.columnIndex], c.queue[i].I64Val.Values[c.columnIndex])
 					return
 				}
 
 				if isNull(c.queue[i].I64Val.Nulls, c.columnIndex) {
 					*d = nil
 				} else {
-					if *d == nil {
-						*d = new(int64)
-					}
 					**d = c.queue[i].I64Val.Values[c.columnIndex]
 				}
 			} else {
@@ -947,16 +929,13 @@ func (c *Cursor) FetchOne(ctx context.Context, dests ...interface{}) {
 			if !ok {
 				d, ok := dests[i].(**string)
 				if !ok {
-					c.Err = errors.Errorf("Unexpected data type %T for value %v (should be %T) index is %v", dests[i], c.queue[i].StringVal.Values[c.columnIndex], c.queue[i].StringVal.Values[c.columnIndex], i)
+					c.Err = errors.Errorf("Unexpected data type %T for value %v (should be %T)", dests[i], c.queue[i].StringVal.Values[c.columnIndex], c.queue[i].StringVal.Values[c.columnIndex])
 					return
 				}
 
 				if isNull(c.queue[i].StringVal.Nulls, c.columnIndex) {
 					*d = nil
 				} else {
-					if *d == nil {
-						*d = new(string)
-					}
 					**d = c.queue[i].StringVal.Values[c.columnIndex]
 				}
 			} else {
@@ -971,16 +950,13 @@ func (c *Cursor) FetchOne(ctx context.Context, dests ...interface{}) {
 			if !ok {
 				d, ok := dests[i].(**float64)
 				if !ok {
-					c.Err = errors.Errorf("Unexpected data type %T for value %v (should be %T) index is %v", dests[i], c.queue[i].DoubleVal.Values[c.columnIndex], c.queue[i].DoubleVal.Values[c.columnIndex], i)
+					c.Err = errors.Errorf("Unexpected data type %T for value %v (should be %T)", dests[i], c.queue[i].DoubleVal.Values[c.columnIndex], c.queue[i].DoubleVal.Values[c.columnIndex])
 					return
 				}
 
 				if isNull(c.queue[i].DoubleVal.Nulls, c.columnIndex) {
 					*d = nil
 				} else {
-					if *d == nil {
-						*d = new(float64)
-					}
 					**d = c.queue[i].DoubleVal.Values[c.columnIndex]
 				}
 			} else {
@@ -995,16 +971,13 @@ func (c *Cursor) FetchOne(ctx context.Context, dests ...interface{}) {
 			if !ok {
 				d, ok := dests[i].(**bool)
 				if !ok {
-					c.Err = errors.Errorf("Unexpected data type %T for value %v (should be %T) index is %v", dests[i], c.queue[i].BoolVal.Values[c.columnIndex], c.queue[i].BoolVal.Values[c.columnIndex], i)
+					c.Err = errors.Errorf("Unexpected data type %T for value %v (should be %T)", dests[i], c.queue[i].BoolVal.Values[c.columnIndex], c.queue[i].BoolVal.Values[c.columnIndex])
 					return
 				}
 
 				if isNull(c.queue[i].BoolVal.Nulls, c.columnIndex) {
 					*d = nil
 				} else {
-					if *d == nil {
-						*d = new(bool)
-					}
 					**d = c.queue[i].BoolVal.Values[c.columnIndex]
 				}
 			} else {
